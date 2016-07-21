@@ -179,19 +179,24 @@ class TestZappa(unittest.TestCase):
     def test_get_api_url(self, session):
         z = Zappa(session)
         z.credentials_arn = 'arn:aws:iam::724336686645:role/ZappaLambdaExecution'
-        url = z.get_api_url('Spheres-demonstration')
+        url = z.get_api_url('Spheres-demonstration', 'demonstration')
 
     @placebo_session
     def test_fetch_logs(self, session):
         z = Zappa(session)
         z.credentials_arn = 'arn:aws:iam::12345:role/ZappaLambdaExecution'
         events = z.fetch_logs('Spheres-demonstration')
-        self.assertTrue(events != None)
+        self.assertTrue(events is not None)
 
     def test_policy_json(self):
         # ensure the policy docs are valid JSON
         json.loads(ASSUME_POLICY)
         json.loads(ATTACH_POLICY)
+
+    def test_schedule_events(self):
+        z = Zappa()
+        path = os.getcwd()
+      # z.schedule_events # TODO
 
     ##
     # Logging
@@ -247,7 +252,7 @@ class TestZappa(unittest.TestCase):
     def test_wsgi_event(self):
 
         event = {
-            "body": {},
+            "body": "",
             "headers": {
                 "Via": "1.1 e604e934e9195aaf3e36195adbcb3e18.cloudfront.net (CloudFront)",
                 "Accept-Language": "en-US,en;q=0.5",
@@ -340,8 +345,16 @@ class TestZappa(unittest.TestCase):
     # Handler
     ##
 
-    def test_handler(self):
-        lh = LambdaHandler('test_settings')
+    @placebo_session
+    def test_handler(self, session):
+        # Init will test load_remote_settings
+        lh = LambdaHandler('test_settings', session=session)
+
+        # Annoyingly, this will fail during record, but
+        # the result will actually be okay to use in playback.
+        # See: https://github.com/garnaat/placebo/issues/48
+        self.assertEqual(os.environ['hello'], 'world')
+
         event = {
             "body": {},
             "headers": {},
@@ -354,6 +367,20 @@ class TestZappa(unittest.TestCase):
         }
         lh.handler(event, None)
 
+        # Test scheduled event
+        event = {   
+                    u'account': u'72333333333', 
+                    u'region': u'us-east-1', 
+                    u'detail': {}, 
+                    u'detail-type': u'Scheduled Event', 
+                    u'source': u'aws.events', 
+                    u'version': u'0', 
+                    u'time': u'2016-05-10T21:05:39Z', 
+                    u'id': u'0d6a6db0-d5e7-4755-93a0-750a8bf49d55', 
+                    u'resources': [u'arn:aws:events:us-east-1:72333333333:rule/tests.test_app.schedule_me']
+                }
+        lh.handler(event, None)
+
     ##
     # CLI
     ##
@@ -364,7 +391,7 @@ class TestZappa(unittest.TestCase):
 
     def test_cli_utility(self):
         zappa_cli = ZappaCLI()
-        zappa_cli.api_stage = 'ttt333'
+        zappa_cli.api_stage = 'ttt888'
         zappa_cli.load_settings('test_settings.json')
         zappa_cli.create_package()
         zappa_cli.remove_local_zip()
@@ -391,19 +418,31 @@ class TestZappa(unittest.TestCase):
     def test_cli_args(self):
         zappa_cli = ZappaCLI()
         # Sanity
-        argv = '-s test_settings.json derp ttt333'.split()
+        argv = '-s test_settings.json derp ttt888'.split()
         zappa_cli.handle(argv)
 
     @placebo_session
     def test_cli_aws(self, session):
         zappa_cli = ZappaCLI()
-        zappa_cli.api_stage = 'ttt333'
+        zappa_cli.api_stage = 'ttt888'
         zappa_cli.load_settings('test_settings.json', session)
         zappa_cli.zappa.credentials_arn = 'arn:aws:iam::724336686645:role/ZappaLambdaExecution'
         zappa_cli.deploy()
         zappa_cli.update()
         zappa_cli.rollback(1)
         zappa_cli.tail(False)
+        zappa_cli.schedule()
+        zappa_cli.unschedule()
+        zappa_cli.undeploy(noconfirm=True)
+
+    ##
+    # Util / Misc
+    ##
+
+    def test_human_units(self):
+        zappa = Zappa()
+        zappa.human_size(1)
+        zappa.human_size(9999999999999)
 
 if __name__ == '__main__':
     unittest.main()

@@ -10,20 +10,20 @@ Deploy arbitrary Python programs as serverless Zappa applications.
 from __future__ import unicode_literals
 
 import argparse
-import datetime
 import inspect
-import importlib
+import imp
 import hjson as json
 import os
-import re
 import requests
 import slugify
 import sys
 import tempfile
-import unicodedata
 import zipfile
+import pkg_resources
+import logging
+import botocore
 
-from zappa import Zappa
+from zappa import Zappa, logger
 
 CUSTOM_SETTINGS = [
     'aws_region',
@@ -37,11 +37,28 @@ CUSTOM_SETTINGS = [
     'touch',
 ]
 
+CLI_COMMANDS = [
+    'deploy',
+    'invoke',
+    'rollback',
+    'schedule',
+    'status',
+    'tail',
+    'undeploy',
+    'unschedule',
+    'update'
+]
+
 ##
 # Main Input Processing
 ##
 
 class ZappaCLI(object):
+    """
+    ZappaCLI object is responsible for loading the settings,
+    handling the input arguments and executing the calls to the core library.
+
+    """
 
     # Zappa settings
     zappa = None
@@ -54,12 +71,15 @@ class ZappaCLI(object):
     prebuild_script = None
     project_name = None
     profile_name = None
+    lambda_arn = None
     lambda_name = None
     s3_bucket_name = None
     settings_file = None
     zip_path = None
     vpc_config = None
     memory_size = None
+    use_apigateway = None
+    lambda_handler = None
 
     def handle(self, argv=None):
         """
@@ -68,30 +88,53 @@ class ZappaCLI(object):
         Parses command, load settings and dispatches accordingly.
 
         """
+        help_message = "Please supply a command to execute. Can be one of: {}".format(', '.join(x for x in sorted(CLI_COMMANDS)))
 
         parser = argparse.ArgumentParser(description='Zappa - Deploy Python applications to AWS Lambda and API Gateway.\n')
-        parser.add_argument('command_env', metavar='U', type=str, nargs='*',
-                       help="Command to execute. Can be one of 'deploy', 'update', 'tail' and 'rollback'.")
+        parser.add_argument('command_env', metavar='U', type=str, nargs='*', help=help_message)
         parser.add_argument('-n', '--num-rollback', type=int, default=0,
                             help='The number of versions to rollback.')
         parser.add_argument('-s', '--settings_file', type=str, default='zappa_settings.json',
                             help='The path to a zappa settings file.')
         parser.add_argument('-a', '--app_function', type=str, default=None,
                             help='The WSGI application function.')
+        parser.add_argument('-v', '--version', action='store_true', help='Print the zappa version', default=False)
+        parser.add_argument('-y', '--yes', action='store_true', help='Auto confirm yes', default=False)
 
         args = parser.parse_args(argv)
+
         vargs = vars(args)
-        if not any(vargs.values()): # pragma: no cover
-            parser.error("Please supply a command to execute. Can be one of 'deploy', 'update', 'tail', rollback', 'invoke'.'")
+        vargs_nosettings = vargs.copy()
+        vargs_nosettings.pop('settings_file')
+        if not any(vargs_nosettings.values()): # pragma: no cover
+            parser.error(help_message)
             return
+
+        # Version requires no arguments
+        if args.version: # pragma: no cover
+            self.print_version()
+            sys.exit(0)
 
         # Parse the input
         command_env = vargs['command_env']
-        if len(command_env) < 2: # pragma: no cover
-            parser.error("Please supply an environment to interact with.")
-            return
         command = command_env[0]
-        self.api_stage = command_env[1]
+
+        if command not in CLI_COMMANDS:
+            print("The command '{}' is not recognized. {}".format(command, help_message))
+            return
+
+        if len(command_env) < 2: # pragma: no cover
+            self.load_settings_file(vargs['settings_file'])
+
+            # If there's only one environment defined in the settings,
+            # use that as the default.
+            if len(self.zappa_settings.keys()) is 1:
+                self.api_stage = self.zappa_settings.keys()[0]
+            else:
+                parser.error("Please supply an environment to interact with.")
+                return
+        else:
+            self.api_stage = command_env[1]
 
         # Load our settings
         self.load_settings(vargs['settings_file'])
@@ -106,17 +149,20 @@ class ZappaCLI(object):
         elif command == 'rollback': # pragma: no cover
             if vargs['num_rollback'] < 1: # pragma: no cover
                 parser.error("Please enter the number of iterations to rollback.")
-                return                
+                return
             self.rollback(vargs['num_rollback'])
         elif command == 'invoke': # pragma: no cover
             self.invoke()
         elif command == 'tail': # pragma: no cover
             self.tail()
         elif command == 'undeploy': # pragma: no cover
-            self.undeploy()
-        else:
-            print("The command '%s' is not recognized." % command)
-            return
+            self.undeploy(noconfirm=vargs['yes'])
+        elif command == 'schedule': # pragma: no cover
+            self.schedule()
+        elif command == 'unschedule': # pragma: no cover
+            self.unschedule()
+        elif command == 'status': # pragma: no cover
+            self.status()
 
     ##
     # The Commands
@@ -140,27 +186,44 @@ class ZappaCLI(object):
         self.create_package()
 
         # Upload it to S3
-        try:
-            zip_arn = self.zappa.upload_to_s3(
+        success = self.zappa.upload_to_s3(
                 self.zip_path, self.s3_bucket_name)
-        except (KeyboardInterrupt, SystemExit): # pragma: no cover
-            raise
+        if not success: # pragma: no cover
+            print("Unable to upload to S3. Quitting.")
+            return
 
         # Register the Lambda function with that zip as the source
         # You'll also need to define the path to your lambda_handler code.
-        lambda_arn = self.zappa.create_lambda_function(bucket=self.s3_bucket_name,
+        self.lambda_arn = self.zappa.create_lambda_function(bucket=self.s3_bucket_name,
                                                        s3_key=self.zip_path,
                                                        function_name=self.lambda_name,
-                                                       handler='handler.lambda_handler',
+                                                       handler=self.lambda_handler,
                                                        vpc_config=self.vpc_config,
+                                                       timeout=self.timeout_seconds,
                                                        memory_size=self.memory_size)
 
-        # Create and configure the API Gateway
-        api_id = self.zappa.create_api_gateway_routes(
-            lambda_arn, self.lambda_name)
+        # Create a Keep Warm for this deployment
+        if self.zappa_settings[self.api_stage].get('keep_warm', True):
+            self.zappa.create_keep_warm(self.lambda_arn, self.lambda_name)
 
-        # Deploy the API!
-        endpoint_url = self.zappa.deploy_api_gateway(api_id, self.api_stage)
+        endpoint_url = ''
+        if self.use_apigateway:
+            # Create and configure the API Gateway
+            api_id = self.zappa.create_api_gateway_routes(
+                self.lambda_arn, self.lambda_name)
+
+            # Deploy the API!
+            cache_cluster_enabled = self.zappa_settings[self.api_stage].get('cache_cluster_enabled', False)
+            cache_cluster_size = str(self.zappa_settings[self.api_stage].get('cache_cluster_size', .5))
+            endpoint_url = self.zappa.deploy_api_gateway(
+                                        api_id=api_id,
+                                        stage_name=self.api_stage,
+                                        cache_cluster_enabled=cache_cluster_enabled,
+                                        cache_cluster_size=cache_cluster_size
+                                    )
+
+            if self.zappa_settings[self.api_stage].get('touch', True):
+                requests.get(endpoint_url)
 
         # Finally, delete the local copy our zip package
         if self.zappa_settings[self.api_stage].get('delete_zip', True):
@@ -169,12 +232,8 @@ class ZappaCLI(object):
         # Remove the uploaded zip from S3, because it is now registered..
         self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
 
-        if self.zappa_settings[self.api_stage].get('touch', True):
-            requests.get(endpoint_url)
+        print("Deployed! {}".format(endpoint_url))
 
-        print("Your Zappa deployment is live!: " + endpoint_url)
-
-        return
 
     def update(self):
         """
@@ -185,16 +244,26 @@ class ZappaCLI(object):
         if self.prebuild_script:
             self.execute_prebuild_script()
 
+        # Make sure the necessary IAM execution roles are available
+        self.zappa.create_iam_roles()
+
         # Create the Lambda Zip,
         self.create_package()
 
         # Upload it to S3
-        self.zappa.upload_to_s3(self.zip_path, self.s3_bucket_name)
+        success = self.zappa.upload_to_s3(self.zip_path, self.s3_bucket_name)
+        if not success: # pragma: no cover
+            print("Unable to upload to S3. Quitting.")
+            return
 
         # Register the Lambda function with that zip as the source
         # You'll also need to define the path to your lambda_handler code.
-        lambda_arn = self.zappa.update_lambda_function(
+        self.lambda_arn = self.zappa.update_lambda_function(
             self.s3_bucket_name, self.zip_path, self.lambda_name)
+
+        # Create a Keep Warm for this deployment
+        if self.zappa_settings[self.api_stage].get('keep_warm', True):
+            self.zappa.create_keep_warm(self.lambda_arn, self.lambda_name)
 
         # Remove the uploaded zip from S3, because it is now registered..
         self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
@@ -203,11 +272,19 @@ class ZappaCLI(object):
         if self.zappa_settings[self.api_stage].get('delete_zip', True):
             os.remove(self.zip_path)
 
-        print("Your updated Zappa deployment is live!")
+        if self.zappa_settings[self.api_stage].get('domain', None):
+            endpoint_url = self.zappa_settings[self.api_stage].get('domain')
+        else:
+            endpoint_url = self.zappa.get_api_url(self.lambda_name, self.api_stage)
+
+        print("Your updated Zappa deployment is live! {}".format(endpoint_url))
 
         return
 
     def rollback(self, revision):
+        """
+        Rollsback the currently deploy lambda code to a previous revision.
+        """
 
         print("Rolling back..")
 
@@ -246,21 +323,101 @@ class ZappaCLI(object):
             try:
                 sys.exit(0)
             except SystemExit:
-                os._exit(0)
+                os._exit(130)
 
+    def undeploy(self, noconfirm=False):
+        """
+        Tear down an exiting deployment.
+        """
 
-    def undeploy(self):
-
-        confirm = raw_input("Are you sure you want to undeploy? [y/n] ")
-        if confirm != 'y':
-            return
+        if not noconfirm: # pragma: no cover
+            confirm = raw_input("Are you sure you want to undeploy? [y/n] ")
+            if confirm != 'y':
+                return
 
         self.zappa.undeploy_api_gateway(self.lambda_name)
+        if self.zappa_settings[self.api_stage].get('keep_warm', True):
+            self.zappa.remove_keep_warm(self.lambda_name)
         self.zappa.delete_lambda_function(self.lambda_name)
 
         print("Done!")
 
         return
+
+    def schedule(self):
+        """
+        Given a a list of functions and a schedule to execute them,
+        setup up regular execution.
+
+        """
+
+        if self.zappa_settings[self.api_stage].get('events'):
+            events = self.zappa_settings[self.api_stage]['events']
+
+            if type(events) != list:
+                print("Events must be supplied as a list.")
+                return
+
+            try:
+                function_response = self.zappa.lambda_client.get_function(FunctionName=self.lambda_name)
+            except botocore.exceptions.ClientError as e:
+                print("Function does not exist, please deploy first. Ex: zappa deploy {}".format(self.api_stage))
+                return
+
+            print("Scheduling..")
+            self.zappa.schedule_events(
+                lambda_arn=function_response['Configuration']['FunctionArn'],
+                lambda_name=function_response['Configuration']['FunctionName'],
+                events=events)
+
+
+    def unschedule(self):
+        """
+        Given a a list of scheduled functions,
+        tear down their regular execution.
+
+        """
+
+        if self.zappa_settings[self.api_stage].get('events', None):
+            events = self.zappa_settings[self.api_stage]['events']
+
+            if type(events) != type([]):
+                print("Events must be supplied as a list.")
+                return
+
+            print("Unscheduling..")
+            self.zappa.unschedule_events(events)
+
+        return
+
+    def invoke(self):
+        """
+        Invoke a remote function.
+        """
+        message = "This ability is not yet available."
+        print(message)
+
+    def status(self):
+        """
+        Describe the status of the current deployment.
+        """
+
+        api_url = self.zappa.get_api_url(
+            self.lambda_name,
+            self.api_stage)
+
+        domain_url = self.zappa_settings[self.api_stage].get('domain', None)
+
+        print("Status for %s:" % self.lambda_name)
+        print('\tAPI Gateway URL:\t' + str(api_url))
+        print('\tDomain URL:\t\t' + str(domain_url))
+
+    def print_version(self):
+        """
+        Print the current zappa version.
+        """
+        version = pkg_resources.require("zappa")[0].version
+        print(version)
 
     ##
     # Utility
@@ -268,29 +425,25 @@ class ZappaCLI(object):
 
     def load_settings(self, settings_file="zappa_settings.json", session=None):
         """
-        Load the local zappa_settings.json file. 
+        Load the local zappa_settings.json file.
+
+        An existing boto session can be supplied, though this is likely for testing purposes.
 
         Returns the loaded Zappa object.
         """
 
-        # Ensure we're passesd a valid settings file.
+        # Ensure we're passed a valid settings file.
         if not os.path.isfile(settings_file):
             print("Please configure your zappa_settings file.")
-            quit() # pragma: no cover
+            sys.exit(1) # pragma: no cover
 
         # Load up file
-        try:
-            with open(settings_file) as json_file:
-                self.zappa_settings = json.load(json_file)
-        except Exception as e: # pragma: no cover
-            print("Problem parsing settings file.")
-            print(e)
-            quit() # pragma: no cover
+        self.load_settings_file(settings_file)
 
         # Make sure that this environment is our settings
         if self.api_stage not in self.zappa_settings.keys():
-            print("Please define '%s' in your Zappa settings." % self.api_stage)
-            quit() # pragma: no cover
+            print("Please define '{0!s}' in your Zappa settings.".format(self.api_stage))
+            sys.exit(1) # pragma: no cover
 
         # We need a working title for this project. Use one if supplied, else cwd dirname.
         if 'project_name' in self.zappa_settings[self.api_stage]: # pragma: no cover
@@ -318,21 +471,38 @@ class ZappaCLI(object):
             self.api_stage].get('prebuild_script', None)
         self.profile_name = self.zappa_settings[
             self.api_stage].get('profile_name', None)
+        self.log_level = self.zappa_settings[
+            self.api_stage].get('log_level', "DEBUG")
+        self.domain = self.zappa_settings[
+            self.api_stage].get('domain', None)
+        self.timeout_seconds = self.zappa_settings[
+            self.api_stage].get('timeout_seconds', 30)
+        self.use_apigateway = self.zappa_settings[
+            self.api_stage].get('use_apigateway', True)
+        self.lambda_handler = self.zappa_settings[
+            self.api_stage].get('lambda_handler', 'handler.lambda_handler')
+        self.remote_env_bucket = self.zappa_settings[
+            self.api_stage].get('remote_env_bucket', None)
+        self.remote_env_file = self.zappa_settings[
+            self.api_stage].get('remote_env_file', None)
 
-        # Create an Zappa object..
-        self.zappa = Zappa(session)
-        self.zappa.aws_region = self.aws_region
+        self.zappa = Zappa(boto_session=session, profile_name=self.profile_name, aws_region=self.aws_region)
 
-        # Load your AWS credentials from ~/.aws/credentials
-        self.zappa.load_credentials(session)
-
-        # ..and configure it
         for setting in CUSTOM_SETTINGS:
-            if self.zappa_settings[self.api_stage].has_key(setting):
+            if setting in self.zappa_settings[self.api_stage]:
                 setattr(self.zappa, setting, self.zappa_settings[
-                        self.api_stage][setting])        
+                        self.api_stage][setting])
 
         return self.zappa
+
+    def load_settings_file(self, settings_file="zappa_settings.json"):
+        try:
+            with open(settings_file) as json_file:
+                self.zappa_settings = json.load(json_file)
+        except Exception as e: # pragma: no cover
+            print("Problem parsing settings file.")
+            print(e)
+            sys.exit(1) # pragma: no cover
 
     def create_package(self):
         """
@@ -352,29 +522,48 @@ class ZappaCLI(object):
         self.zip_path = self.zappa.create_lambda_zip(
                 self.lambda_name,
                 handler_file=handler_file,
-                use_precompiled_packages=self.zappa_settings.get('use_precompiled_packages', True),
-                exclude=self.zappa_settings.get('exclude', [])
+                use_precompiled_packages=self.zappa_settings[self.api_stage].get('use_precompiled_packages', True),
+                exclude=self.zappa_settings[self.api_stage].get('exclude', [])
             )
 
-        # Throw our setings into it
-        with zipfile.ZipFile(self.zip_path, 'a') as lambda_zip:
-            app_module, app_function = self.app_function.rsplit('.', 1)
-            settings_s = "# Generated by Zappa\nAPP_MODULE='%s'\nAPP_FUNCTION='%s'\n" % (app_module, app_function)
-            
-            if self.debug is not None:
-                settings_s = settings_s + "DEBUG='%s'" % (self.debug) # Cast to Bool in handler
+        if self.app_function:
+            # Throw custom setings into the zip file
+            with zipfile.ZipFile(self.zip_path, 'a') as lambda_zip:
+                app_module, app_function = self.app_function.rsplit('.', 1)
+                settings_s = "# Generated by Zappa\nAPP_MODULE='{0!s}'\nAPP_FUNCTION='{1!s}'\n".format(app_module, app_function)
 
-            # Lambda requires a specific chmod
-            temp_settings = tempfile.NamedTemporaryFile(delete=False)
-            os.chmod(temp_settings.name, 0644)
-            temp_settings.write(settings_s)
-            temp_settings.close()
-            lambda_zip.write(temp_settings.name, 'zappa_settings.py')
-            os.remove(temp_settings.name)
+                if self.debug:
+                    settings_s = settings_s + "DEBUG='{0!s}'\n".format((self.debug)) # Cast to Bool in handler
+                settings_s = settings_s + "LOG_LEVEL='{0!s}'\n".format((self.log_level))
 
-            lambda_zip.close()
+                # If we're on a domain, we don't need to define the /<<env>> in
+                # the WSGI PATH
+                if self.domain:
+                    settings_s = settings_s + "DOMAIN='{0!s}'\n".format((self.domain))
+                else:
+                    settings_s = settings_s + "DOMAIN=None\n"
 
-        return
+                # Pass through remote config bucket and path
+                if self.remote_env_bucket and self.remote_env_file:
+                    settings_s = settings_s + "REMOTE_ENV_BUCKET='{0!s}'\n".format(
+                        self.remote_env_bucket
+                    )
+                    settings_s = settings_s + "REMOTE_ENV_FILE='{0!s}'\n".format(
+                        self.remote_env_file
+                    )
+
+                # We can be environment-aware
+                settings_s = settings_s + "API_STAGE='{0!s}'\n".format((self.api_stage))
+
+                # Lambda requires a specific chmod
+                temp_settings = tempfile.NamedTemporaryFile(delete=False)
+                os.chmod(temp_settings.name, 0644)
+                temp_settings.write(settings_s)
+                temp_settings.close()
+                lambda_zip.write(temp_settings.name, 'zappa_settings.py')
+                os.remove(temp_settings.name)
+                # lambda_zip.close()
+
 
     def remove_local_zip(self):
         """
@@ -401,7 +590,7 @@ class ZappaCLI(object):
     def print_logs(self, logs):
         """
         Parse, filter and print logs to the console.
-        
+
         """
 
         for log in logs:
@@ -426,7 +615,7 @@ class ZappaCLI(object):
         prebuild_module_s, prebuild_function_s = self.prebuild_script.rsplit('.', 1)
 
         # The module
-        prebuild_module = importlib.import_module(prebuild_module_s)
+        prebuild_module = imp.load_source(prebuild_module_s, prebuild_module_s + '.py')
 
         # The function
         prebuild_function = getattr(prebuild_module, prebuild_function_s)
@@ -439,17 +628,22 @@ class ZappaCLI(object):
 ####################################################################
 
 def handle(): # pragma: no cover
+    """
+    Main program execution handler.
+    """
+
     try:
         cli = ZappaCLI()
         sys.exit(cli.handle())
     except (KeyboardInterrupt, SystemExit): # pragma: no cover
         if cli.zip_path: # Remove the Zip from S3 upon failure.
             cli.remove_uploaded_zip()
-        return
+        sys.exit(130)
     except Exception as e:
         if cli.zip_path: # Remove the Zip from S3 upon failure.
             cli.remove_uploaded_zip()
         print(e)
+        sys.exit(1)
 
 if __name__ == '__main__': # pragma: no cover
     handle()
